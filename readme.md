@@ -16,6 +16,8 @@ Create a `config` sheet with keys in column A and values in column B. Keys are c
 
 Choose **FOLIO Inventory → Create inventory** and enter your password. The account needs inventory instance read permission. Authentication uses `/authn/login-with-expiry`; passwords and tokens are not persisted. Instances are fetched from `/inventory/instances` in pages of 100.
 
+Read the [full usage instructions here](./docs/instructions.md).
+
 ## Output
 
 Each run creates a sheet with one instance per row and discovered JSON leaf paths as headers, including fields first encountered in later records. Objects use dotted paths (`metadata.createdDate`); arrays use indexes (`contributors.0.name`). Null and missing values are blank; empty objects and arrays add no columns.
