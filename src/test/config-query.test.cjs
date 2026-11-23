@@ -226,12 +226,12 @@ test('getConfig parses formatted max rows and cql query and rejects invalid max 
 test('buildCqlQuery composes filters and respects existing sortby outside quotes', () => {
   const { context } = loadApp()
 
-  assert.equal(context.buildCqlQuery(''), 'cql.allRecords=1 sortby id')
-  assert.equal(context.buildCqlQuery('status.name=="Available"'), 'status.name=="Available" sortby id')
+  assert.equal(context.buildCqlQuery(''), 'cql.allRecords=1 sortby effectiveShelvingOrder')
+  assert.equal(context.buildCqlQuery('status.name=="Available"'), 'status.name=="Available" sortby effectiveShelvingOrder')
   assert.equal(context.buildCqlQuery('status.name=="Available" sortby barcode'), 'status.name=="Available" sortby barcode')
-  assert.equal(context.buildCqlQuery('title="sortby demo"'), 'title="sortby demo" sortby id')
+  assert.equal(context.buildCqlQuery('title="sortby demo"'), 'title="sortby demo" sortby effectiveShelvingOrder')
   assert.equal(
-    context.buildCqlQuery(['status.name=="Available"', 'barcode=="123"'], 'effectiveShelvingOrder'),
+    context.buildCqlQuery(['status.name=="Available"', 'barcode=="123"']),
     '(status.name=="Available") and (barcode=="123") sortby effectiveShelvingOrder'
   )
 })
@@ -301,7 +301,7 @@ test('getItems clamps final page size to maxRows and flags truncation accurately
   assert.equal(new URL(requests[0].url).searchParams.get('limit'), '100')
   assert.equal(new URL(requests[1].url).searchParams.get('limit'), '50')
   assert.equal(new URL(requests[1].url).searchParams.get('offset'), '100')
-  assert.equal(new URL(requests[0].url).searchParams.get('query'), 'status.name=="Available" sortby id')
+  assert.equal(new URL(requests[0].url).searchParams.get('query'), 'status.name=="Available" sortby effectiveShelvingOrder')
 })
 
 test('getItems does not flag truncation when totalRecords equals maxRows', () => {

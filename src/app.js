@@ -324,7 +324,7 @@ function authenticate(config, password) {
 }
 
 // Compose one or more CQL filter clauses with an optional sortby clause.
-function buildCqlQuery(filter, sortBy = 'id') {
+function buildCqlQuery(filter, sortBy = 'effectiveShelvingOrder') {
   const clauses = (Array.isArray(filter) ? filter : [filter])
     .map(clause => String(clause || '').trim())
     .filter(Boolean)
@@ -347,7 +347,7 @@ function buildCqlQuery(filter, sortBy = 'id') {
 // FOLIO API request to /inventory/items
 function getItems(config, token) {
   const maxRows = config.maxRows || DEFAULT_MAX_ROWS
-  const query = buildCqlQuery(config.cqlQuery, 'id')
+  const query = buildCqlQuery(config.cqlQuery)
   const items = []
   let offset = 0
   let totalRecords = null
