@@ -21,7 +21,7 @@ export default [
       // Apps Script invokes these through menus and the HTML service bridge.
       'no-unused-vars': ['error', {
         caughtErrors: 'none',
-        varsIgnorePattern: '^(onOpen|showPasswordDialog|createInventory)$'
+        varsIgnorePattern: '^(onOpen|showPasswordDialog|createInventory|setupConfigSheet)$'
       }]
     },
     languageOptions: {

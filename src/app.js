@@ -1,21 +1,103 @@
-// Add { header: 'Column label', path: 'nested.json.field' } entries here later.
-// Numeric path segments select array entries. Leave empty to discover all JSON leaf fields.
-const INSTANCE_COLUMNS = []
-const INSTANCE_PAGE_SIZE = 100
+const ITEM_PAGE_SIZE = 100
 const DEFAULT_MAX_ROWS = 2000
 // Backend-only override for SCELC central tenant; leave empty for members
 let AUTH_TENANT_OVERRIDE = ''
-// let AUTH_TENANT_OVERRIDE = 'cs00000003'
-// REM: cast sheet strings to lowercase before comparing with these
-const REQUIRED_CONFIG_KEYS = ['api url', 'tenant id', 'username']
-const OPTIONAL_CONFIG_KEYS = ['max rows', 'cql query']
+// AUTH_TENANT_OVERRIDE = 'cs00000003'
+// Config tab settings keyed by config property name.
+// REM: cast sheet strings to lowercase before comparing with setting labels
+const CONFIG_SETTINGS = {
+  url: { label: 'API URL', required: true, defaultValue: '' },
+  tenant: { label: 'Tenant ID', required: true, defaultValue: '' },
+  username: { label: 'Username', required: true, defaultValue: '' },
+  maxRows: { label: 'Max rows', required: false, defaultValue: DEFAULT_MAX_ROWS },
+  cqlQuery: { label: 'CQL query', required: false, defaultValue: '' }
+}
+const FIELDS_SECTION_HEADER = 'Return fields'
 
-/* exported onOpen, showPasswordDialog, createInventory */
+// Field descriptor modeled on Caltech Library's Boffo project.
+function Field(name, enabled, required, getValue) {
+  this.name = name
+  this.enabled = enabled
+  this.required = required
+  this.getValue = getValue
+}
+
+// Concatenate a string property across an array of objects.
+function collect(list, subfield, separator = '; ') {
+  if (!Array.isArray(list)) return ''
+  return list
+    .map(entry => (entry && entry[subfield] ? String(entry[subfield]).trim() : ''))
+    .filter(Boolean)
+    .join(separator)
+}
+
+// Concatenate an array of plain strings (e.g. administrativeNotes).
+function collectStrings(list, separator = '\n') {
+  if (!Array.isArray(list)) return ''
+  return list
+    .map(entry => (entry == null ? '' : String(entry).trim()))
+    .filter(Boolean)
+    .join(separator)
+}
+
+// Concatenate FOLIO note objects ({ note }) across separate lines.
+function collectNotes(list) {
+  return collect(list, 'note', '\n')
+}
+
+// Assemble a full display call number from FOLIO's effective call number components and item parts.
+function formatCallNumber(item) {
+  const parts = item.effectiveCallNumberComponents || {}
+  const base = parts.callNumber || item.callNumber || ''
+  return [
+    parts.prefix,
+    base,
+    parts.suffix,
+    item.volume,
+    item.enumeration,
+    item.chronology,
+    item.copyNumber
+  ]
+    .map(part => (part == null ? '' : String(part).trim()))
+    .filter(Boolean)
+    .join(' ')
+}
+
+// FOLIO /inventory/items fields available as checkboxes on the config sheet.
+const FIELDS = [
+  //         Name                       Enabled Required getValue(item)
+  new Field('Item UUID',                 true,   false,  item => item.id),
+  new Field('Barcode',                   true,   true,   item => item.barcode),
+  new Field('Title',                     true,   false,  item => item.title),
+  new Field('Call number',               true,   false,  item => formatCallNumber(item)),
+  new Field('Location',                  true,   false,  item => item.effectiveLocation && item.effectiveLocation.name),
+  new Field('Item status',               true,   false,  item => item.status && item.status.name),
+  new Field('Item notes',                true,   false,  item => collectNotes(item.notes)),
+  new Field('Administrative notes',      true,   false,  item => collectStrings(item.administrativeNotes)),
+  new Field('Contributor names',         false,  false,  item => collect(item.contributorNames, 'name')),
+  new Field('Circulation notes',         false,  false,  item => collectNotes(item.circulationNotes)),
+  new Field('Material type',             false,  false,  item => item.materialType && item.materialType.name),
+  new Field('Permanent loan type',       false,  false,  item => item.permanentLoanType && item.permanentLoanType.name),
+  new Field('Temporary loan type',       false,  false,  item => item.temporaryLoanType && item.temporaryLoanType.name),
+  new Field('Permanent location',        false,  false,  item => item.permanentLocation && item.permanentLocation.name),
+  new Field('Temporary location',        false,  false,  item => item.temporaryLocation && item.temporaryLocation.name),
+  new Field('Copy number',               false,  false,  item => item.copyNumber),
+  new Field('Volume',                    false,  false,  item => item.volume),
+  new Field('Enumeration',               false,  false,  item => item.enumeration),
+  new Field('Chronology',                false,  false,  item => item.chronology),
+  new Field('Item HRID',                 false,  false,  item => item.hrid),
+  new Field('Holdings UUID',             false,  false,  item => item.holdingsRecordId),
+  new Field('Status date',               false,  false,  item => item.status && item.status.date),
+  new Field('Effective shelving order',  false,  false,  item => item.effectiveShelvingOrder)
+]
+
+/* exported onOpen, showPasswordDialog, createInventory, setupConfigSheet */
 
 // On opening the sheet, add a "FOLIO Inventory" menu
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('FOLIO Inventory')
     .addItem('Create inventory', 'showPasswordDialog')
+    .addItem('Setup config sheet', 'setupConfigSheet')
     .addToUi()
 }
 
@@ -28,60 +110,158 @@ function showPasswordDialog() {
   )
 }
 
+// Create or update the "config" tab with core settings and a collapsed field checkbox group.
+function setupConfigSheet() {
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet()
+  let sheet = spreadsheet.getSheetByName('config')
+  if (!sheet) sheet = spreadsheet.insertSheet('config')
+
+  const existingKeys = new Map()
+  const lastRow = sheet.getLastRow()
+
+  if (lastRow > 0) {
+    sheet.getRange(1, 1, lastRow, 2).getDisplayValues().forEach((row, index) => {
+      const key = String(row[0]).trim().toLocaleLowerCase()
+      if (key && !existingKeys.has(key)) existingKeys.set(key, index + 1)
+    })
+  }
+
+  let nextRow = lastRow + 1
+
+  Object.values(CONFIG_SETTINGS).forEach(({ label, defaultValue }) => {
+    const key = label.toLocaleLowerCase()
+    if (!existingKeys.has(key)) {
+      sheet.getRange(nextRow, 1, 1, 2).setValues([[label, defaultValue]])
+      existingKeys.set(key, nextRow)
+      nextRow += 1
+    }
+  })
+
+  const headerKey = FIELDS_SECTION_HEADER.toLocaleLowerCase()
+  if (!existingKeys.has(headerKey)) {
+    const headerRange = sheet.getRange(nextRow, 1, 1, 2)
+    headerRange.setValues([[FIELDS_SECTION_HEADER, 'Include']])
+    if (typeof headerRange.setFontWeight === 'function') headerRange.setFontWeight('bold')
+    existingKeys.set(headerKey, nextRow)
+    nextRow += 1
+  }
+
+  const addedFieldStart = nextRow
+
+  FIELDS.forEach(field => {
+    const key = field.name.toLocaleLowerCase()
+    if (!existingKeys.has(key)) {
+      const rowRange = sheet.getRange(nextRow, 1, 1, 2)
+      rowRange.setValues([[field.name, field.enabled]])
+      const checkboxCell = sheet.getRange(nextRow, 2, 1, 1)
+      if (typeof checkboxCell.insertCheckboxes === 'function') checkboxCell.insertCheckboxes()
+      existingKeys.set(key, nextRow)
+      nextRow += 1
+    }
+  })
+
+  const addedFieldCount = nextRow - addedFieldStart
+  if (addedFieldCount > 0) {
+    const groupRange = sheet.getRange(addedFieldStart, 1, addedFieldCount, 1)
+    if (typeof groupRange.shiftRowGroupDepth === 'function') {
+      groupRange.shiftRowGroupDepth(1)
+    }
+    if (typeof sheet.collapseAllRowGroups === 'function') {
+      sheet.collapseAllRowGroups()
+    }
+  }
+
+  return spreadsheet.setActiveSheet(sheet)
+}
+
 // Main function, referenced in password.html
 function createInventory(password) {
   if (typeof password !== 'string' || !password) throw new Error('Enter your FOLIO password.')
 
   const config = getConfig()
   const token = authenticate(config, password)
-  const { instances, totalRecords, truncated } = getInstances(config, token)
+  const { items, totalRecords, truncated } = getItems(config, token)
 
-  if (!instances.length) {
+  if (!items.length) {
     return { sheetName: null, count: 0, totalRecords, truncated: false }
   }
 
-  const sheet = writeInstances(instances)
+  const sheet = writeItems(items, config.fields)
 
   return {
     sheetName: sheet.getName(),
-    count: instances.length,
+    count: items.length,
     totalRecords,
     truncated
   }
 }
 
-// Pull configuration values from a sheet named "config"
+// Parse Google Sheets checkbox display values ("TRUE"/"FALSE") or raw booleans.
+function parseCheckbox(value) {
+  if (typeof value === 'boolean') return value
+  const normalized = String(value || '').trim().toLocaleLowerCase()
+  if (normalized === 'true') return true
+  if (normalized === 'false') return false
+  return null
+}
+
+// Pull configuration values and optional field checkboxes from a sheet named "config"
 function getConfig() {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('config')
-  if (!sheet) throw new Error(`Create a sheet named "config" with ${REQUIRED_CONFIG_KEYS.join(', ')} in column A and their values in column B.`)
+  const entries = Object.entries(CONFIG_SETTINGS)
+  const requiredSettings = entries.filter(([, setting]) => setting.required)
+  if (!sheet) {
+    const names = requiredSettings.map(([, setting]) => setting.label).join(', ')
+    throw new Error(`Create a sheet named "config" with ${names} in column A and their values in column B.`)
+  }
 
-  const knownKeys = [...REQUIRED_CONFIG_KEYS, ...OPTIONAL_CONFIG_KEYS]
+  const settingKeyByLabel = new Map(
+    entries.map(([key, setting]) => [setting.label.toLocaleLowerCase(), key])
+  )
+  const fieldsByKey = new Map(FIELDS.map(field => [field.name.toLocaleLowerCase(), field]))
   const values = {}
+  const fieldOverrides = {}
 
   sheet.getDataRange().getDisplayValues().forEach(row => {
-    const key = String(row[0]).trim().toLocaleLowerCase()
-    if (knownKeys.includes(key)) values[key] = String(row[1] || '').trim()
+    const label = String(row[0]).trim().toLocaleLowerCase()
+    if (settingKeyByLabel.has(label)) {
+      values[settingKeyByLabel.get(label)] = String(row[1] || '').trim()
+    } else if (fieldsByKey.has(label)) {
+      const checked = parseCheckbox(row[1])
+      if (checked !== null) fieldOverrides[fieldsByKey.get(label).name] = checked
+    }
   })
 
-  const missing = REQUIRED_CONFIG_KEYS.filter(key => !values[key])
+  const missing = requiredSettings
+    .filter(([key]) => !values[key])
+    .map(([, setting]) => setting.label)
   if (missing.length) throw new Error(`Missing config values: ${missing.join(', ')}`)
 
-  let maxRows = DEFAULT_MAX_ROWS
-  if (values['max rows']) {
+  let maxRows = CONFIG_SETTINGS.maxRows.defaultValue
+  if (values.maxRows) {
     // Strip thousands separators that Google Sheets display formatting may add.
-    const parsed = Number(values['max rows'].replace(/,/g, ''))
+    const parsed = Number(values.maxRows.replace(/,/g, ''))
     if (!Number.isInteger(parsed) || parsed < 1) {
-      throw new Error('Config value "max rows" must be a positive whole number.')
+      throw new Error(`Config value "${CONFIG_SETTINGS.maxRows.label}" must be a positive whole number.`)
     }
     maxRows = parsed
   }
 
+  const fields = FIELDS.filter(field => {
+    if (field.required) return true
+    if (Object.prototype.hasOwnProperty.call(fieldOverrides, field.name)) {
+      return fieldOverrides[field.name]
+    }
+    return field.enabled
+  })
+
   return {
-    url: values['api url'].replace(/\/+$/, ''),
-    tenant: values['tenant id'],
+    url: values.url.replace(/\/+$/, ''),
+    tenant: values.tenant,
     username: values.username,
     maxRows,
-    cqlQuery: values['cql query'] || ''
+    cqlQuery: values.cqlQuery || CONFIG_SETTINGS.cqlQuery.defaultValue,
+    fields
   }
 }
 
@@ -107,6 +287,7 @@ function http(config, path, token, body, tenant = config.tenant) {
   } catch (err) {
     throw new Error('FOLIO request failed. Check the gateway URL and network access.', { cause: err })
   }
+
   const status = response.getResponseCode()
   if (status < 200 || status >= 300) {
     Logger.log(`HTTP error. Response headers: ${response.getHeaders()}\nResponse body: ${response.getContentText()}`)
@@ -163,86 +344,67 @@ function buildCqlQuery(filter, sortBy = 'id') {
   return query
 }
 
-// FOLIO API request to /inventory/instances
-function getInstances(config, token) {
+// FOLIO API request to /inventory/items
+function getItems(config, token) {
   const maxRows = config.maxRows || DEFAULT_MAX_ROWS
   const query = buildCqlQuery(config.cqlQuery, 'id')
-  const instances = []
+  const items = []
   let offset = 0
   let totalRecords = null
 
-  while (instances.length < maxRows) {
-    const remaining = maxRows - instances.length
-    const pageSize = Math.min(INSTANCE_PAGE_SIZE, remaining)
-    const path = `/inventory/instances?limit=${pageSize}&offset=${offset}&query=${encodeURIComponent(query)}`
+  while (items.length < maxRows) {
+    const remaining = maxRows - items.length
+    const pageSize = Math.min(ITEM_PAGE_SIZE, remaining)
+    const path = `/inventory/items?limit=${pageSize}&offset=${offset}&query=${encodeURIComponent(query)}`
     const response = http(config, path, token)
 
     let body
     try {
       body = JSON.parse(response.getContentText())
     } catch (err) {
-      throw new Error('FOLIO instances response was not valid JSON.', { cause: err })
+      throw new Error('FOLIO items response was not valid JSON.', { cause: err })
     }
 
-    if (!body || !Array.isArray(body.instances)) throw new Error('Expected an instances array from FOLIO.')
+    if (!body || !Array.isArray(body.items)) throw new Error('Expected an items array from FOLIO.')
 
     if (Number.isInteger(body.totalRecords)) totalRecords = body.totalRecords
 
-    const page = body.instances.slice(0, remaining)
-    instances.push(...page)
+    const page = body.items.slice(0, remaining)
+    items.push(...page)
     offset += page.length
 
-    if (body.instances.length < pageSize ||
+    if (body.items.length < pageSize ||
       (Number.isInteger(totalRecords) && offset >= totalRecords)) {
-      return { instances, totalRecords, truncated: false }
+      return { items, totalRecords, truncated: false }
     }
   }
 
   // Flag truncation when more records exist (or totalRecords is absent after hitting the cap).
-  const truncated = Number.isInteger(totalRecords) ? totalRecords > instances.length : true
-  return { instances, totalRecords, truncated }
+  const truncated = Number.isInteger(totalRecords) ? totalRecords > items.length : true
+  return { items, totalRecords, truncated }
 }
 
-// Ensure values function in Google Sheets before writing them
+// Ensure values function safely in Google Sheets before writing them
 function cellValue(value) {
   if (value === undefined || value === null) return ''
   const cell = value
   if (typeof cell !== 'string') return cell
-  if (cell.length > 50000) throw new Error('An output value exceeds the Google Sheets 50,000-character cell limit. Configure specific JSON fields in INSTANCE_COLUMNS.')
+  if (cell.length > 50000) throw new Error('An output value exceeds the Google Sheets 50,000-character cell limit.')
   // Prevent API strings from being evaluated as spreadsheet formulas.
   return /^[=+\-@]/.test(cell) ? "'" + cell : cell
 }
 
-// Flatten arrays by index so related values (for example identifier type and value)
-// stay together. Empty objects/arrays have no leaf values and produce no columns.
-// TODO We need a better way to handle multi-value object arrays which create so many columns
-// TODO e.g. subjects are {authorityId, value, sourceId, typeId} so there's 4 cols each
-function flattenInstance(value, path = '', fields = new Map()) {
-  if (value !== null && typeof value === 'object') {
-    Object.keys(value).forEach(key => {
-      flattenInstance(value[key], path ? `${path}.${key}` : key, fields)
-    })
-  } else if (path) {
-    fields.set(path, value)
-  }
-  return fields
+function getDefaultFields() {
+  return FIELDS.filter(field => field.required || field.enabled)
 }
 
-// Write instances JSON onto a sheet
-function writeInstances(instances) {
-  const flattened = instances.map(instance => flattenInstance(instance))
+// Write FOLIO item records onto a new sheet using the selected field descriptors.
+function writeItems(items, fields = getDefaultFields()) {
+  const columns = fields.length ? fields : getDefaultFields()
+  const rows = [columns.map(field => cellValue(field.name))]
 
-  // Use every record to discover fields
-  let paths = new Set()
-  flattened.forEach(fields => fields.forEach((value, path) => paths.add(path)))
-
-  const columns = INSTANCE_COLUMNS.length
-    ? INSTANCE_COLUMNS
-    : Array.from(paths, path => ({header: path, path}))
-
-  let rows = [columns.map(column => cellValue(column.header))]
-  flattened.forEach(fields => {
-    rows.push(columns.map(column => cellValue(fields.get(column.path))))
+  items.forEach(item => {
+    rows.push(columns.map(field => cellValue(field.getValue(item))))
   })
 
   const spreadsheet = SpreadsheetApp.getActiveSpreadsheet()
