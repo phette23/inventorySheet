@@ -3,7 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "lint": "eslint .",
+    "lint": "eslint --cache .",
     "test": "node --test",
     "validate": "pnpm lint && pnpm test"
   },
