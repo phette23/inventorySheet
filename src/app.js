@@ -1,8 +1,6 @@
 const ITEM_PAGE_SIZE = 100
 const DEFAULT_MAX_ROWS = 2000
-// Backend-only override for SCELC central tenant; leave empty for members
-let AUTH_TENANT_OVERRIDE = ''
-// AUTH_TENANT_OVERRIDE = 'cs00000003'
+const SCELC_CENTRAL_TENANT = 'cs00000003'
 // Config tab settings keyed by config property name.
 // REM: cast sheet strings to lowercase before comparing with setting labels
 const CONFIG_SETTINGS = {
@@ -297,8 +295,10 @@ function http(config, path, token, body, tenant = config.tenant) {
   return response
 }
 
-// Trade username & password for an access token
-function authenticate(config, password, authTenant = AUTH_TENANT_OVERRIDE || config.tenant) {
+// Trade username & password for an access token.
+// SCELC Office accounts (@scelc.org) authenticate against the central tenant before querying member data.
+function authenticate(config, password) {
+  const authTenant = /@scelc\.org$/i.test(config.username) ? SCELC_CENTRAL_TENANT : config.tenant
   const response = http(config, '/authn/login-with-expiry', null, {
     username: config.username, password
   }, authTenant)

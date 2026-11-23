@@ -6,7 +6,7 @@ const path = require('node:path')
 
 const APP_SOURCE = fs.readFileSync(path.join(__dirname, '../app.js'), 'utf8')
 
-function loadApp({ configRows = [], hasConfigSheet = true, fetchImpl, authTenantOverride } = {}) {
+function loadApp({ configRows = [], hasConfigSheet = true, fetchImpl } = {}) {
   const requests = []
   const createdSheets = []
   const storedConfigRows = configRows.map(row => [...row])
@@ -81,11 +81,7 @@ function loadApp({ configRows = [], hasConfigSheet = true, fetchImpl, authTenant
     Logger: { log: () => {} }
   })
 
-  const source = authTenantOverride !== undefined
-    ? APP_SOURCE.replace("let AUTH_TENANT_OVERRIDE = ''", `let AUTH_TENANT_OVERRIDE = ${JSON.stringify(authTenantOverride)}`)
-    : APP_SOURCE
-
-  vm.runInContext(source, context)
+  vm.runInContext(APP_SOURCE, context)
   return {
     context,
     requests,
@@ -240,13 +236,12 @@ test('buildCqlQuery composes filters and respects existing sortby outside quotes
   )
 })
 
-test('AUTH_TENANT_OVERRIDE only changes the auth request tenant header', () => {
-  const { context, requests } = loadApp({
-    authTenantOverride: 'central',
+test('@scelc.org usernames authenticate against the SCELC central tenant while querying the member tenant', () => {
+  const scelc = loadApp({
     configRows: [
       ['api url', 'https://okapi.example.org'],
       ['tenant id', 'member-a'],
-      ['username', 'scelc-admin']
+      ['username', 'Staff@SCELC.ORG']
     ],
     fetchImpl: url => {
       if (url.includes('/authn/login-with-expiry')) {
@@ -256,12 +251,30 @@ test('AUTH_TENANT_OVERRIDE only changes the auth request tenant header', () => {
     }
   })
 
-  const result = context.createInventory('secret')
+  const result = scelc.context.createInventory('secret')
   assert.equal(result.count, 1)
-  assert.equal(requests.length, 2)
-  assert.equal(requests[0].options.headers['x-okapi-tenant'], 'central')
-  assert.equal(requests[1].options.headers['x-okapi-tenant'], 'member-a')
-  assert.ok(requests[1].url.includes('/inventory/items?'))
+  assert.equal(scelc.requests.length, 2)
+  assert.equal(scelc.requests[0].options.headers['x-okapi-tenant'], 'cs00000003')
+  assert.equal(scelc.requests[1].options.headers['x-okapi-tenant'], 'member-a')
+  assert.ok(scelc.requests[1].url.includes('/inventory/items?'))
+
+  const member = loadApp({
+    configRows: [
+      ['api url', 'https://okapi.example.org'],
+      ['tenant id', 'member-a'],
+      ['username', 'librarian@puc.edu']
+    ],
+    fetchImpl: url => {
+      if (url.includes('/authn/login-with-expiry')) {
+        return jsonResponse({ accessToken: 'tok-456' })
+      }
+      return jsonResponse({ items: [{ id: '2', barcode: '456', title: 'Book 2' }], totalRecords: 1 })
+    }
+  })
+
+  member.context.createInventory('secret')
+  assert.equal(member.requests[0].options.headers['x-okapi-tenant'], 'member-a')
+  assert.equal(member.requests[1].options.headers['x-okapi-tenant'], 'member-a')
 })
 
 test('getItems clamps final page size to maxRows and flags truncation accurately', () => {
