@@ -2,8 +2,13 @@
 // Numeric path segments select array entries. Leave empty to discover all JSON leaf fields.
 const INSTANCE_COLUMNS = []
 const INSTANCE_PAGE_SIZE = 100
+const DEFAULT_MAX_ROWS = 2000
+// Backend-only override for SCELC central tenant; leave empty for members
+let AUTH_TENANT_OVERRIDE = ''
+// let AUTH_TENANT_OVERRIDE = 'cs00000003'
 // REM: cast sheet strings to lowercase before comparing with these
-const CONFIG_VALUES = ["api url", "tenant id", "username"]
+const REQUIRED_CONFIG_KEYS = ['api url', 'tenant id', 'username']
+const OPTIONAL_CONFIG_KEYS = ['max rows', 'cql query']
 
 /* exported onOpen, showPasswordDialog, createInventory */
 
@@ -29,37 +34,60 @@ function createInventory(password) {
 
   const config = getConfig()
   const token = authenticate(config, password)
-  const instances = getInstances(config, token)
+  const { instances, totalRecords, truncated } = getInstances(config, token)
+
+  if (!instances.length) {
+    return { sheetName: null, count: 0, totalRecords, truncated: false }
+  }
+
   const sheet = writeInstances(instances)
 
-  return { sheetName: sheet.getName(), count: instances.length }
+  return {
+    sheetName: sheet.getName(),
+    count: instances.length,
+    totalRecords,
+    truncated
+  }
 }
 
 // Pull configuration values from a sheet named "config"
 function getConfig() {
   const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName('config')
-  if (!sheet) throw new Error(`Create a sheet named "config" with ${CONFIG_VALUES.join(', ')} in column A and their values in column B.`)
+  if (!sheet) throw new Error(`Create a sheet named "config" with ${REQUIRED_CONFIG_KEYS.join(', ')} in column A and their values in column B.`)
 
+  const knownKeys = [...REQUIRED_CONFIG_KEYS, ...OPTIONAL_CONFIG_KEYS]
   const values = {}
 
   sheet.getDataRange().getDisplayValues().forEach(row => {
     const key = String(row[0]).trim().toLocaleLowerCase()
-    if (CONFIG_VALUES.includes(key)) values[key] = String(row[1] || '').trim()
+    if (knownKeys.includes(key)) values[key] = String(row[1] || '').trim()
   })
 
-  const missing = CONFIG_VALUES.filter(key => !values[key])
+  const missing = REQUIRED_CONFIG_KEYS.filter(key => !values[key])
   if (missing.length) throw new Error(`Missing config values: ${missing.join(', ')}`)
 
+  let maxRows = DEFAULT_MAX_ROWS
+  if (values['max rows']) {
+    // Strip thousands separators that Google Sheets display formatting may add.
+    const parsed = Number(values['max rows'].replace(/,/g, ''))
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      throw new Error('Config value "max rows" must be a positive whole number.')
+    }
+    maxRows = parsed
+  }
+
   return {
-    url: values["api url"].replace(/\/+$/, ''),
-    tenant: values["tenant id"],
-    username: values.username
+    url: values['api url'].replace(/\/+$/, ''),
+    tenant: values['tenant id'],
+    username: values.username,
+    maxRows,
+    cqlQuery: values['cql query'] || ''
   }
 }
 
 // HTTP request with FOLIO authentication
-function http(config, path, token, body) {
-  const headers = { 'x-okapi-tenant': config.tenant, Accept: 'application/json' }
+function http(config, path, token, body, tenant = config.tenant) {
+  const headers = { 'x-okapi-tenant': tenant, Accept: 'application/json' }
   if (token) headers['x-okapi-token'] = token
   const options = {
     headers,
@@ -89,10 +117,10 @@ function http(config, path, token, body) {
 }
 
 // Trade username & password for an access token
-function authenticate(config, password) {
+function authenticate(config, password, authTenant = AUTH_TENANT_OVERRIDE || config.tenant) {
   const response = http(config, '/authn/login-with-expiry', null, {
     username: config.username, password
-  })
+  }, authTenant)
   let body = {}
 
   try {
@@ -114,15 +142,41 @@ function authenticate(config, password) {
   throw new Error('FOLIO login returned no access token. Check the authentication endpoint for your deployment.')
 }
 
+// Compose one or more CQL filter clauses with an optional sortby clause.
+function buildCqlQuery(filter, sortBy = 'id') {
+  const clauses = (Array.isArray(filter) ? filter : [filter])
+    .map(clause => String(clause || '').trim())
+    .filter(Boolean)
+
+  let query = clauses.length === 0
+    ? 'cql.allRecords=1'
+    : clauses.length === 1
+      ? clauses[0]
+      : clauses.map(clause => `(${clause})`).join(' and ')
+
+  // Ignore quoted text when checking if the caller already specified a sortby clause.
+  const unquoted = query.replace(/"(?:\\.|[^"])*"/g, '')
+  if (sortBy && !/\bsortby\b/i.test(unquoted)) {
+    query += ` sortby ${sortBy}`
+  }
+
+  return query
+}
+
 // FOLIO API request to /inventory/instances
-// TODO currently pages through all, probably needs a limit & a CQL filter
 function getInstances(config, token) {
+  const maxRows = config.maxRows || DEFAULT_MAX_ROWS
+  const query = buildCqlQuery(config.cqlQuery, 'id')
   const instances = []
   let offset = 0
+  let totalRecords = null
 
-  while (true) {
-    const path = `/inventory/instances?limit=${INSTANCE_PAGE_SIZE}&offset=${offset}&query=${encodeURIComponent('cql.allRecords=1 sortby id')}`
+  while (instances.length < maxRows) {
+    const remaining = maxRows - instances.length
+    const pageSize = Math.min(INSTANCE_PAGE_SIZE, remaining)
+    const path = `/inventory/instances?limit=${pageSize}&offset=${offset}&query=${encodeURIComponent(query)}`
     const response = http(config, path, token)
+
     let body
     try {
       body = JSON.parse(response.getContentText())
@@ -132,14 +186,21 @@ function getInstances(config, token) {
 
     if (!body || !Array.isArray(body.instances)) throw new Error('Expected an instances array from FOLIO.')
 
-    instances.push(...body.instances)
-    offset += body.instances.length
+    if (Number.isInteger(body.totalRecords)) totalRecords = body.totalRecords
 
-    if (body.instances.length < INSTANCE_PAGE_SIZE ||
-      (Number.isInteger(body.totalRecords) && offset >= body.totalRecords)) {
-      return instances
+    const page = body.instances.slice(0, remaining)
+    instances.push(...page)
+    offset += page.length
+
+    if (body.instances.length < pageSize ||
+      (Number.isInteger(totalRecords) && offset >= totalRecords)) {
+      return { instances, totalRecords, truncated: false }
     }
   }
+
+  // Flag truncation when more records exist (or totalRecords is absent after hitting the cap).
+  const truncated = Number.isInteger(totalRecords) ? totalRecords > instances.length : true
+  return { instances, totalRecords, truncated }
 }
 
 // Ensure values function in Google Sheets before writing them
