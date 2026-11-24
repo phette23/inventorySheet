@@ -7,6 +7,10 @@ const CONFIG_SETTINGS = {
   url: { label: 'API URL', required: true, defaultValue: '' },
   tenant: { label: 'Tenant ID', required: true, defaultValue: '' },
   username: { label: 'Username', required: true, defaultValue: '' },
+  callNumberStart: { label: 'Call number start', required: false, defaultValue: '' },
+  callNumberEnd: { label: 'Call number end', required: false, defaultValue: '' },
+  statusFilter: { label: 'Status filter', required: false, defaultValue: '' },
+  noteContains: { label: 'Note contains', required: false, defaultValue: '' },
   maxRows: { label: 'Max rows', required: false, defaultValue: DEFAULT_MAX_ROWS },
   cqlQuery: { label: 'CQL query', required: false, defaultValue: '' }
 }
@@ -184,7 +188,7 @@ function createInventory(password) {
     return { sheetName: null, count: 0, totalRecords, truncated: false }
   }
 
-  const sheet = writeItems(items, config.fields)
+  const sheet = writeItems(items, config.fields, buildSheetName(config))
 
   return {
     sheetName: sheet.getName(),
@@ -257,6 +261,10 @@ function getConfig() {
     url: values.url.replace(/\/+$/, ''),
     tenant: values.tenant,
     username: values.username,
+    callNumberStart: values.callNumberStart || CONFIG_SETTINGS.callNumberStart.defaultValue,
+    callNumberEnd: values.callNumberEnd || CONFIG_SETTINGS.callNumberEnd.defaultValue,
+    statusFilter: values.statusFilter || CONFIG_SETTINGS.statusFilter.defaultValue,
+    noteContains: values.noteContains || CONFIG_SETTINGS.noteContains.defaultValue,
     maxRows,
     cqlQuery: values.cqlQuery || CONFIG_SETTINGS.cqlQuery.defaultValue,
     fields
@@ -323,22 +331,90 @@ function authenticate(config, password) {
   throw new Error('FOLIO login returned no access token. Check the authentication endpoint for your deployment.')
 }
 
+// Escape characters with special meaning inside CQL double-quoted strings.
+function escapeCql(value) {
+  return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+}
+
+// Split a trailing unquoted `sortby ...` clause from a CQL expression so it stays outside parentheses.
+function splitSortBy(cql) {
+  let inQuotes = false
+  for (let i = 0; i < cql.length; i++) {
+    if (cql[i] === '"' && cql[i - 1] !== '\\') {
+      inQuotes = !inQuotes
+    } else if (!inQuotes && (i === 0 || /\s/.test(cql[i - 1]))) {
+      const match = cql.slice(i).match(/^sortby\s+(.+)$/i)
+      if (match) {
+        return { filter: cql.slice(0, i).trim(), sortBy: match[1].trim() }
+      }
+    }
+  }
+  return { filter: cql.trim(), sortBy: '' }
+}
+
+// Translate plain-language config filters into CQL clauses for /inventory/items.
+function buildFilterClauses(config = {}) {
+  const clauses = []
+
+  if (config.callNumberStart) {
+    const start = escapeCql(String(config.callNumberStart).trim().toUpperCase())
+    if (start) clauses.push(`effectiveShelvingOrder>="${start}"`)
+  }
+
+  if (config.callNumberEnd) {
+    // Append "~" (ASCII 126) so an upper bound like "QC" includes all "QC ..." items up to "QD".
+    const end = escapeCql(String(config.callNumberEnd).trim().toUpperCase())
+    if (end) clauses.push(`effectiveShelvingOrder<="${end}~"`)
+  }
+
+  if (config.statusFilter) {
+    const statuses = String(config.statusFilter)
+      .split(',')
+      .map(status => status.trim())
+      .filter(Boolean)
+    if (statuses.length === 1) {
+      clauses.push(`status.name=="${escapeCql(statuses[0])}"`)
+    } else if (statuses.length > 1) {
+      clauses.push(statuses.map(status => `status.name=="${escapeCql(status)}"`).join(' or '))
+    }
+  }
+
+  if (config.noteContains) {
+    const term = escapeCql(String(config.noteContains).trim())
+    if (term) clauses.push(`notes=="*${term}*" or administrativeNotes=="*${term}*"`)
+  }
+
+  if (config.cqlQuery) {
+    clauses.push(config.cqlQuery)
+  }
+
+  return clauses
+}
+
 // Compose one or more CQL filter clauses with an optional sortby clause.
 function buildCqlQuery(filter, sortBy = 'effectiveShelvingOrder') {
-  const clauses = (Array.isArray(filter) ? filter : [filter])
+  const rawClauses = (Array.isArray(filter) ? filter : [filter])
     .map(clause => String(clause || '').trim())
     .filter(Boolean)
 
-  let query = clauses.length === 0
-    ? 'cql.allRecords=1'
-    : clauses.length === 1
-      ? clauses[0]
-      : clauses.map(clause => `(${clause})`).join(' and ')
+  const filters = []
+  let explicitSort = ''
 
-  // Ignore quoted text when checking if the caller already specified a sortby clause.
-  const unquoted = query.replace(/"(?:\\.|[^"])*"/g, '')
-  if (sortBy && !/\bsortby\b/i.test(unquoted)) {
-    query += ` sortby ${sortBy}`
+  rawClauses.forEach(clause => {
+    const parts = splitSortBy(clause)
+    if (parts.filter) filters.push(parts.filter)
+    if (parts.sortBy) explicitSort = parts.sortBy
+  })
+
+  let query = filters.length === 0
+    ? 'cql.allRecords=1'
+    : filters.length === 1
+      ? filters[0]
+      : filters.map(clause => `(${clause})`).join(' and ')
+
+  const effectiveSort = explicitSort || sortBy
+  if (effectiveSort) {
+    query += ` sortby ${effectiveSort}`
   }
 
   return query
@@ -347,7 +423,7 @@ function buildCqlQuery(filter, sortBy = 'effectiveShelvingOrder') {
 // FOLIO API request to /inventory/items
 function getItems(config, token) {
   const maxRows = config.maxRows || DEFAULT_MAX_ROWS
-  const query = buildCqlQuery(config.cqlQuery)
+  const query = buildCqlQuery(buildFilterClauses(config))
   const items = []
   let offset = 0
   let totalRecords = null
@@ -398,8 +474,49 @@ function getDefaultFields() {
   return FIELDS.filter(field => field.required || field.enabled)
 }
 
+function formatIsoDate(date) {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+// Build a descriptive tab name from active filters and the run date (e.g. "QA-QC Available 2026-11-23").
+function buildSheetName(config = {}, date = new Date()) {
+  const parts = []
+  const start = String(config.callNumberStart || '').trim().toUpperCase()
+  const end = String(config.callNumberEnd || '').trim().toUpperCase()
+
+  if (start && end) {
+    parts.push(start === end ? start : `${start}-${end}`)
+  } else if (start) {
+    parts.push(`${start}+`)
+  } else if (end) {
+    parts.push(`to ${end}`)
+  }
+
+  if (config.statusFilter) {
+    parts.push(String(config.statusFilter).trim())
+  }
+
+  if (!parts.length) parts.push('Inventory')
+  parts.push(formatIsoDate(date))
+
+  // Google Sheets forbids : \ / ? * [ ] in tab names and caps names at 100 chars.
+  return parts.join(' ').replace(/[:\\/?*[\]]/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 90)
+}
+
+// Append " (2)", " (3)", ... when a sheet with the same name already exists.
+function uniqueSheetName(spreadsheet, baseName) {
+  if (!baseName || typeof spreadsheet.getSheetByName !== 'function') return baseName
+  if (!spreadsheet.getSheetByName(baseName)) return baseName
+  let suffix = 2
+  while (spreadsheet.getSheetByName(`${baseName} (${suffix})`)) suffix += 1
+  return `${baseName} (${suffix})`
+}
+
 // Write FOLIO item records onto a new sheet using the selected field descriptors.
-function writeItems(items, fields = getDefaultFields()) {
+function writeItems(items, fields = getDefaultFields(), sheetName = '') {
   const columns = fields.length ? fields : getDefaultFields()
   const rows = [columns.map(field => cellValue(field.name))]
 
@@ -408,7 +525,8 @@ function writeItems(items, fields = getDefaultFields()) {
   })
 
   const spreadsheet = SpreadsheetApp.getActiveSpreadsheet()
-  const sheet = spreadsheet.insertSheet() // Automatically assigns a unique name.
+  const name = uniqueSheetName(spreadsheet, sheetName)
+  const sheet = name ? spreadsheet.insertSheet(name) : spreadsheet.insertSheet()
 
   // Ensure the sheet's dimensions are large enough for the data
   if (rows.length > sheet.getMaxRows()) {

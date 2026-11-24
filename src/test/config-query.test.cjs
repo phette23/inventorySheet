@@ -48,7 +48,10 @@ function loadApp({ configRows = [], hasConfigSheet = true, fetchImpl } = {}) {
   const context = vm.createContext({
     SpreadsheetApp: {
       getActiveSpreadsheet: () => ({
-        getSheetByName: name => (name === 'config' ? configSheet : null),
+        getSheetByName: name => {
+          if (name === 'config') return configSheet
+          return createdSheets.find(sheet => sheet.name === name) || null
+        },
         insertSheet: name => {
           if (name === 'config') {
             configSheet = makeConfigSheet()
@@ -170,7 +173,11 @@ test('setupConfigSheet creates collapsed field checkboxes and preserves existing
   assert.equal(firstRun.rowGroupDepthShifts, 1)
   assert.equal(firstRun.collapsedGroups, 1)
   assert.equal(storedConfigRows[0][1], 'https://okapi.example.org')
-  assert.deepEqual(storedConfigRows.slice(3, 5), [
+  assert.deepEqual(storedConfigRows.slice(3, 9), [
+    ['Call number start', ''],
+    ['Call number end', ''],
+    ['Status filter', ''],
+    ['Note contains', ''],
     ['Max rows', 2000],
     ['CQL query', '']
   ])
@@ -182,17 +189,28 @@ test('setupConfigSheet creates collapsed field checkboxes and preserves existing
   assert.equal(stats().rowGroupDepthShifts, 1)
 })
 
-test('setupConfigSheet scaffolds properly cased labels on a new config sheet', () => {
+test('setupConfigSheet scaffolds properly cased labels without colliding with field names', () => {
   const { context, storedConfigRows } = loadApp({ hasConfigSheet: false })
 
   context.setupConfigSheet()
-  assert.deepEqual(storedConfigRows.slice(0, 5), [
+  assert.deepEqual(storedConfigRows.slice(0, 9), [
     ['API URL', ''],
     ['Tenant ID', ''],
     ['Username', ''],
+    ['Call number start', ''],
+    ['Call number end', ''],
+    ['Status filter', ''],
+    ['Note contains', ''],
     ['Max rows', 2000],
     ['CQL query', '']
   ])
+
+  const settingLabels = Object.values(vm.runInContext('CONFIG_SETTINGS', context))
+    .map(setting => setting.label.toLocaleLowerCase())
+  const fieldNames = vm.runInContext('FIELDS', context)
+    .map(field => field.name.toLocaleLowerCase())
+  const overlap = settingLabels.filter(label => fieldNames.includes(label))
+  assert.deepEqual(overlap, [])
 })
 
 test('getConfig parses formatted max rows and cql query and rejects invalid max rows', () => {
@@ -223,7 +241,7 @@ test('getConfig parses formatted max rows and cql query and rejects invalid max 
   }
 })
 
-test('buildCqlQuery composes filters and respects existing sortby outside quotes', () => {
+test('buildCqlQuery composes filters and keeps explicit sortby outside parentheses', () => {
   const { context } = loadApp()
 
   assert.equal(context.buildCqlQuery(''), 'cql.allRecords=1 sortby effectiveShelvingOrder')
@@ -231,9 +249,70 @@ test('buildCqlQuery composes filters and respects existing sortby outside quotes
   assert.equal(context.buildCqlQuery('status.name=="Available" sortby barcode'), 'status.name=="Available" sortby barcode')
   assert.equal(context.buildCqlQuery('title="sortby demo"'), 'title="sortby demo" sortby effectiveShelvingOrder')
   assert.equal(
-    context.buildCqlQuery(['status.name=="Available"', 'barcode=="123"']),
-    '(status.name=="Available") and (barcode=="123") sortby effectiveShelvingOrder'
+    context.buildCqlQuery(['status.name=="Available"', 'barcode=="123" sortby barcode']),
+    '(status.name=="Available") and (barcode=="123") sortby barcode'
   )
+  assert.equal(
+    context.buildCqlQuery(['status.name=="Available"', 'sortby barcode']),
+    'status.name=="Available" sortby barcode'
+  )
+})
+
+test('buildFilterClauses translates plain-language filters and composes with raw CQL', () => {
+  const { context } = loadApp()
+
+  const clauses = context.buildFilterClauses({
+    callNumberStart: 'qa',
+    callNumberEnd: 'qc',
+    statusFilter: 'Available, Missing',
+    noteContains: '2026-11',
+    cqlQuery: 'materialType.name=="book"'
+  })
+
+  assert.equal(
+    context.buildCqlQuery(clauses),
+    '(effectiveShelvingOrder>="QA") and (effectiveShelvingOrder<="QC~") and (status.name=="Available" or status.name=="Missing") and (notes=="*2026-11*" or administrativeNotes=="*2026-11*") and (materialType.name=="book") sortby effectiveShelvingOrder'
+  )
+})
+
+test('buildSheetName formats filter ranges and deduplicates repeated runs', () => {
+  const { context, createdSheets } = loadApp({
+    configRows: [
+      ['API URL', 'https://okapi.example.org'],
+      ['Tenant ID', 'member-a'],
+      ['Username', 'librarian'],
+      ['Call number start', 'qa'],
+      ['Call number end', 'qc'],
+      ['Status filter', 'Available']
+    ],
+    fetchImpl: url => {
+      if (url.includes('/authn/login-with-expiry')) {
+        return jsonResponse({ accessToken: 'tok-123' })
+      }
+      return jsonResponse({ items: [{ id: '1', barcode: '123', title: 'Book' }], totalRecords: 1 })
+    }
+  })
+
+  const fixedDate = new Date(2026, 10, 23)
+  assert.equal(context.buildSheetName({}, fixedDate), 'Inventory 2026-11-23')
+  assert.equal(
+    context.buildSheetName({ callNumberStart: 'qa', callNumberEnd: 'qc', statusFilter: 'Available' }, fixedDate),
+    'QA-QC Available 2026-11-23'
+  )
+  assert.equal(
+    context.buildSheetName({ callNumberStart: 'qa', callNumberEnd: 'qa' }, fixedDate),
+    'QA 2026-11-23'
+  )
+  assert.equal(
+    context.buildSheetName({ callNumberStart: 'qa' }, fixedDate),
+    'QA+ 2026-11-23'
+  )
+
+  const first = context.createInventory('secret')
+  const second = context.createInventory('secret')
+  assert.ok(first.sheetName.startsWith('QA-QC Available '))
+  assert.equal(second.sheetName, `${first.sheetName} (2)`)
+  assert.equal(createdSheets.length, 2)
 })
 
 test('@scelc.org usernames authenticate against the SCELC central tenant while querying the member tenant', () => {
