@@ -422,3 +422,173 @@ test('createInventory skips sheet creation when zero records match', () => {
   assert.deepEqual({ ...result }, { sheetName: null, count: 0, totalRecords: 0, truncated: false })
   assert.equal(createdSheets.length, 0)
 })
+
+test('createInventory enriches items with holdings action note and OCN when checked', () => {
+  const { context, requests, createdSheets } = loadApp({
+    configRows: [
+      ['API URL', 'https://okapi.example.org'],
+      ['Tenant ID', 'member-a'],
+      ['Username', 'librarian'],
+      ['Holdings action note', true],
+      ['OCN', true]
+    ],
+    fetchImpl: url => {
+      if (url.includes('/authn/login-with-expiry')) {
+        return jsonResponse({ accessToken: 'tok-123' })
+      }
+      if (url.includes('/inventory/items?')) {
+        return jsonResponse({
+          items: [
+            { id: 'i1', barcode: '111', title: 'Book A', holdingsRecordId: 'h1' },
+            { id: 'i2', barcode: '222', title: 'Book A copy 2', holdingsRecordId: 'h1' },
+            { id: 'i3', barcode: '333', title: 'Book B', holdingsRecordId: 'h2' }
+          ],
+          totalRecords: 3
+        })
+      }
+      if (url.includes('/holdings-note-types?')) {
+        return jsonResponse({
+          holdingsNoteTypes: [
+            { id: 'nt-other', name: 'General note' },
+            { id: 'nt-action', name: 'Action note' }
+          ]
+        })
+      }
+      if (url.includes('/identifier-types?')) {
+        return jsonResponse({
+          identifierTypes: [
+            { id: 'id-isbn', name: 'ISBN' },
+            { id: 'id-oclc', name: 'oclc' }
+          ]
+        })
+      }
+      if (url.includes('/holdings-storage/holdings?')) {
+        return jsonResponse({
+          holdingsRecords: [
+            {
+              id: 'h1',
+              instanceId: 'inst-1',
+              notes: [
+                { holdingsNoteTypeId: 'nt-other', note: 'Ignore me' },
+                { holdingsNoteTypeId: 'nt-action', note: 'SCELC shared print retention' },
+                { holdingsNoteTypeId: 'nt-action', note: 'Retain until 2040' }
+              ]
+            },
+            {
+              id: 'h2',
+              instanceId: 'inst-2',
+              notes: []
+            }
+          ]
+        })
+      }
+      if (url.includes('/instance-storage/instances?')) {
+        return jsonResponse({
+          instances: [
+            {
+              id: 'inst-1',
+              identifiers: [
+                { identifierTypeId: 'id-isbn', value: '9780123456789' },
+                { identifierTypeId: 'id-oclc', value: '(OCoLC)123456' },
+                { identifierTypeId: 'id-oclc', value: '(OCoLC)789012' }
+              ]
+            },
+            {
+              id: 'inst-2',
+              identifiers: [{ identifierTypeId: 'id-isbn', value: '9789999999999' }]
+            }
+          ]
+        })
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    }
+  })
+
+  const result = context.createInventory('secret')
+  assert.equal(result.count, 3)
+
+  const rows = createdSheets[0].rows
+  const col = (row, header) => rows[row][rows[0].indexOf(header)]
+  assert.equal(col(1, 'Holdings action note'), 'SCELC shared print retention\nRetain until 2040')
+  assert.equal(col(1, 'OCN'), '(OCoLC)123456; (OCoLC)789012')
+  assert.equal(col(2, 'Holdings action note'), 'SCELC shared print retention\nRetain until 2040')
+  assert.equal(col(2, 'OCN'), '(OCoLC)123456; (OCoLC)789012')
+  assert.equal(col(3, 'Holdings action note'), '')
+  assert.equal(col(3, 'OCN'), '')
+
+  // Deduplicated holdings query should only request h1 once alongside h2.
+  const holdingsReq = requests.find(r => r.url.includes('/holdings-storage/holdings?'))
+  assert.equal(new URL(holdingsReq.url).searchParams.get('limit'), '2')
+  assert.equal(new URL(holdingsReq.url).searchParams.get('query'), 'id==("h1" or "h2")')
+})
+
+test('enrichItems skips unnecessary lookups when only one enrichment field is selected', () => {
+  const { context, requests } = loadApp({
+    fetchImpl: url => {
+      if (url.includes('/identifier-types?')) {
+        return jsonResponse({ identifierTypes: [{ id: 'id-oclc', name: 'OCLC' }] })
+      }
+      if (url.includes('/instance-storage/instances?')) {
+        return jsonResponse({
+          instances: [{ id: 'inst-1', identifiers: [{ identifierTypeId: 'id-oclc', value: '(OCoLC)555' }] }]
+        })
+      }
+      throw new Error(`Unexpected URL: ${url}`)
+    }
+  })
+
+  const allFields = vm.runInContext('FIELDS', context)
+  const ocnOnly = allFields.filter(f => f.name === 'Barcode' || f.name === 'OCN')
+  const enriched = context.enrichItems(
+    { url: 'https://okapi.example.org', tenant: 'member-a', fields: ocnOnly },
+    'tok-123',
+    [{ id: 'i1', barcode: '111', holdingsRecordId: 'h1', instanceId: 'inst-1' }]
+  )
+
+  assert.equal(enriched[0]._ocn, '(OCoLC)555')
+  assert.equal(requests.some(r => r.url.includes('/holdings-note-types')), false)
+  assert.equal(requests.some(r => r.url.includes('/holdings-storage/holdings')), false)
+})
+
+test('fetchRecordsByIds chunks large UUID lists into URL-safe batches', () => {
+  const { context, requests } = loadApp({
+    fetchImpl: url => {
+      const query = new URL(url).searchParams.get('query')
+      const ids = [...query.matchAll(/"([^"]+)"/g)].map(match => match[1])
+      return jsonResponse({ holdingsRecords: ids.map(id => ({ id, instanceId: `inst-${id}` })) })
+    }
+  })
+
+  const ids = Array.from({ length: 85 }, (_, i) => `h-${i}`)
+  const map = context.fetchRecordsByIds(
+    { url: 'https://okapi.example.org', tenant: 'member-a' },
+    'tok-123',
+    '/holdings-storage/holdings',
+    'holdingsRecords',
+    [...ids, 'h-0', '', null]
+  )
+
+  assert.equal(map.size, 85)
+  assert.equal(requests.length, 3)
+  assert.deepEqual(
+    requests.map(r => Number(new URL(r.url).searchParams.get('limit'))),
+    [40, 40, 5]
+  )
+})
+
+test('lookupTypeId throws a clear error when a required FOLIO type name is missing', () => {
+  const { context } = loadApp({
+    fetchImpl: () => jsonResponse({ holdingsNoteTypes: [{ id: 'nt-1', name: 'General note' }] })
+  })
+
+  assert.throws(
+    () => context.lookupTypeId(
+      { url: 'https://okapi.example.org', tenant: 'member-a' },
+      'tok-123',
+      '/holdings-note-types',
+      'holdingsNoteTypes',
+      'Action note'
+    ),
+    /Action note/
+  )
+})

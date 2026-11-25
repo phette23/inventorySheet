@@ -1,6 +1,12 @@
 const ITEM_PAGE_SIZE = 100
+const BATCH_ID_CHUNK_SIZE = 40
 const DEFAULT_MAX_ROWS = 2000
 const SCELC_CENTRAL_TENANT = 'cs00000003'
+const HOLDINGS_ACTION_NOTE_FIELD = 'Holdings action note'
+const OCN_FIELD = 'OCN'
+// shortcut: matches "Action note" and "OCLC" by exact name; make configurable if a tenant uses custom type names
+const HOLDINGS_ACTION_NOTE_TYPE = 'Action note'
+const OCN_IDENTIFIER_TYPE = 'OCLC'
 // Config tab settings keyed by config property name.
 // REM: cast sheet strings to lowercase before comparing with setting labels
 const CONFIG_SETTINGS = {
@@ -90,7 +96,9 @@ const FIELDS = [
   new Field('Item HRID',                 false,  false,  item => item.hrid),
   new Field('Holdings UUID',             false,  false,  item => item.holdingsRecordId),
   new Field('Status date',               false,  false,  item => item.status && item.status.date),
-  new Field('Effective shelving order',  false,  false,  item => item.effectiveShelvingOrder)
+  new Field('Effective shelving order',  false,  false,  item => item.effectiveShelvingOrder),
+  new Field(HOLDINGS_ACTION_NOTE_FIELD,  false,  false,  item => item._holdingsActionNote),
+  new Field(OCN_FIELD,                   false,  false,  item => item._ocn)
 ]
 
 /* exported onOpen, showPasswordDialog, createInventory, setupConfigSheet */
@@ -188,7 +196,8 @@ function createInventory(password) {
     return { sheetName: null, count: 0, totalRecords, truncated: false }
   }
 
-  const sheet = writeItems(items, config.fields, buildSheetName(config))
+  const enrichedItems = enrichItems(config, token, items)
+  const sheet = writeItems(enrichedItems, config.fields, buildSheetName(config))
 
   return {
     sheetName: sheet.getName(),
@@ -301,6 +310,16 @@ function http(config, path, token, body, tenant = config.tenant) {
   }
 
   return response
+}
+
+// Perform a GET request and parse the JSON response body.
+function httpJson(config, path, token, label) {
+  const response = http(config, path, token)
+  try {
+    return JSON.parse(response.getContentText())
+  } catch (err) {
+    throw new Error(`FOLIO ${label} response was not valid JSON.`, { cause: err })
+  }
 }
 
 // Trade username & password for an access token.
@@ -432,14 +451,7 @@ function getItems(config, token) {
     const remaining = maxRows - items.length
     const pageSize = Math.min(ITEM_PAGE_SIZE, remaining)
     const path = `/inventory/items?limit=${pageSize}&offset=${offset}&query=${encodeURIComponent(query)}`
-    const response = http(config, path, token)
-
-    let body
-    try {
-      body = JSON.parse(response.getContentText())
-    } catch (err) {
-      throw new Error('FOLIO items response was not valid JSON.', { cause: err })
-    }
+    const body = httpJson(config, path, token, 'items')
 
     if (!body || !Array.isArray(body.items)) throw new Error('Expected an items array from FOLIO.')
 
@@ -458,6 +470,99 @@ function getItems(config, token) {
   // Flag truncation when more records exist (or totalRecords is absent after hitting the cap).
   const truncated = Number.isInteger(totalRecords) ? totalRecords > items.length : true
   return { items, totalRecords, truncated }
+}
+
+// Resolve a FOLIO reference-data UUID by case-insensitive name (e.g. "Action note", "OCLC").
+function lookupTypeId(config, token, endpoint, arrayKey, typeName) {
+  const body = httpJson(config, `${endpoint}?limit=1000`, token, arrayKey)
+  if (!body || !Array.isArray(body[arrayKey])) {
+    throw new Error(`Expected a ${arrayKey} array from FOLIO.`)
+  }
+  const target = typeName.toLocaleLowerCase()
+  const match = body[arrayKey].find(entry => entry && String(entry.name || '').trim().toLocaleLowerCase() === target)
+  if (!match || !match.id) {
+    throw new Error(`FOLIO ${arrayKey} entry "${typeName}" was not found.`)
+  }
+  return match.id
+}
+
+// Batch-fetch FOLIO storage records by UUID in URL-safe CQL chunks.
+function fetchRecordsByIds(config, token, endpoint, arrayKey, ids) {
+  const uniqueIds = [...new Set(ids.filter(Boolean))]
+  const byId = new Map()
+
+  for (let i = 0; i < uniqueIds.length; i += BATCH_ID_CHUNK_SIZE) {
+    const chunk = uniqueIds.slice(i, i + BATCH_ID_CHUNK_SIZE)
+    const query = `id==(${chunk.map(id => `"${escapeCql(id)}"`).join(' or ')})`
+    const path = `${endpoint}?limit=${chunk.length}&query=${encodeURIComponent(query)}`
+    const body = httpJson(config, path, token, arrayKey)
+    if (!body || !Array.isArray(body[arrayKey])) {
+      throw new Error(`Expected a ${arrayKey} array from FOLIO.`)
+    }
+    body[arrayKey].forEach(record => {
+      if (record && record.id) byId.set(record.id, record)
+    })
+  }
+
+  return byId
+}
+
+// Enrich items with parent holdings action notes and/or instance OCNs only when selected.
+function enrichItems(config, token, items) {
+  const selected = new Set((config.fields || []).map(field => field.name))
+  const wantActionNote = selected.has(HOLDINGS_ACTION_NOTE_FIELD)
+  const wantOcn = selected.has(OCN_FIELD)
+  if (!items.length || (!wantActionNote && !wantOcn)) return items
+
+  const actionNoteTypeId = wantActionNote
+    ? lookupTypeId(config, token, '/holdings-note-types', 'holdingsNoteTypes', HOLDINGS_ACTION_NOTE_TYPE)
+    : null
+  const ocnTypeId = wantOcn
+    ? lookupTypeId(config, token, '/identifier-types', 'identifierTypes', OCN_IDENTIFIER_TYPE)
+    : null
+
+  // /inventory/items does not reliably include instanceId, so fetch parent holdings whenever
+  // action notes are requested or an item lacks instanceId for OCN lookup.
+  const holdingsIds = wantActionNote
+    ? items.map(item => item.holdingsRecordId)
+    : items.filter(item => !item.instanceId).map(item => item.holdingsRecordId)
+  const holdingsById = fetchRecordsByIds(
+    config, token, '/holdings-storage/holdings', 'holdingsRecords', holdingsIds
+  )
+
+  let instancesById = new Map()
+  if (wantOcn) {
+    const instanceIds = items.map(item => {
+      const holdings = holdingsById.get(item.holdingsRecordId)
+      return item.instanceId || (holdings && holdings.instanceId)
+    })
+    instancesById = fetchRecordsByIds(
+      config, token, '/instance-storage/instances', 'instances', instanceIds
+    )
+  }
+
+  return items.map(item => {
+    const enriched = Object.assign({}, item)
+    const holdings = holdingsById.get(item.holdingsRecordId)
+
+    if (wantActionNote) {
+      const notes = holdings && Array.isArray(holdings.notes)
+        ? holdings.notes.filter(note => note && note.holdingsNoteTypeId === actionNoteTypeId)
+        : []
+      enriched._holdingsActionNote = collectNotes(notes)
+    }
+
+    if (wantOcn) {
+      const instanceId = item.instanceId || (holdings && holdings.instanceId)
+      const instance = instancesById.get(instanceId)
+      const ocns = instance && Array.isArray(instance.identifiers)
+        ? instance.identifiers.filter(id => id && id.identifierTypeId === ocnTypeId)
+        : []
+      enriched._ocn = collect(ocns, 'value')
+    }
+
+    return enriched
+  })
 }
 
 // Ensure values function safely in Google Sheets before writing them
