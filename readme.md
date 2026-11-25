@@ -34,6 +34,7 @@ Node.js ≥22.13.0 and pnpm.
 pnpm install
 pnpm lint # ESLint: Apps Script, embedded HTML JavaScript, config, and tests
 pnpm test # Node test runner
+pnpm test:live # Live FOLIO integration tests (uses .env or FOLIO_* env vars)
 pnpm validate # Lint and tests
 ```
 

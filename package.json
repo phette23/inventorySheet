@@ -4,7 +4,8 @@
   "type": "module",
   "scripts": {
     "lint": "eslint --cache .",
-    "test": "node --test",
+    "test": "node --test src/test/*.test.cjs",
+    "test:live": "node --env-file-if-exists=.env --test src/test/live.integration.cjs",
     "validate": "pnpm lint && pnpm test"
   },
   "devDependencies": {
