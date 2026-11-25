@@ -6,12 +6,12 @@ const path = require('node:path')
 
 const APP_SOURCE = fs.readFileSync(path.join(__dirname, '../app.js'), 'utf8')
 
-function loadApp({ configRows = [], hasConfigSheet = true, fetchImpl } = {}) {
+function loadApp({ configRows = [], configRowGroups = [], hasConfigSheet = true, fetchImpl } = {}) {
   const requests = []
   const createdSheets = []
   const storedConfigRows = configRows.map(row => [...row])
+  const rowGroups = configRowGroups.map(group => ({ ...group }))
   let checkboxesInserted = 0
-  let rowGroupDepthShifts = 0
   let collapsedGroups = 0
 
   function makeConfigSheet() {
@@ -19,13 +19,38 @@ function loadApp({ configRows = [], hasConfigSheet = true, fetchImpl } = {}) {
       name: 'config',
       getName: () => 'config',
       getLastRow: () => storedConfigRows.length,
+      getLastColumn: () => storedConfigRows.reduce((max, row) => Math.max(max, row.length), 0),
       getDataRange: () => ({
         getDisplayValues: () => storedConfigRows.map(row => row.map(v => (typeof v === 'boolean' ? String(v).toUpperCase() : String(v))))
       }),
+      getRowGroupDepth: rowIndex => rowGroups
+        .filter(group => rowIndex >= group.start && rowIndex <= group.end)
+        .length,
+      getRowGroup: (rowIndex, depth) => {
+        const matching = rowGroups.filter(group => rowIndex >= group.start && rowIndex <= group.end)
+        const target = matching[depth - 1]
+        if (!target) throw new Error(`No row group at row ${rowIndex} depth ${depth}`)
+        return {
+          remove: () => {
+            const idx = rowGroups.indexOf(target)
+            if (idx >= 0) rowGroups.splice(idx, 1)
+          }
+        }
+      },
       getRange: (startRow, startCol, numRows, numCols) => ({
+        getValues: () => storedConfigRows
+          .slice(startRow - 1, startRow - 1 + numRows)
+          .map(row => Array.from({ length: numCols }, (_, i) => {
+            const val = row[startCol - 1 + i]
+            return val === undefined ? '' : val
+          })),
         getDisplayValues: () => storedConfigRows
           .slice(startRow - 1, startRow - 1 + numRows)
-          .map(row => row.slice(startCol - 1, startCol - 1 + numCols).map(v => (typeof v === 'boolean' ? String(v).toUpperCase() : String(v)))),
+          .map(row => Array.from({ length: numCols }, (_, i) => {
+            const v = row[startCol - 1 + i]
+            if (v === undefined || v === null) return ''
+            return typeof v === 'boolean' ? String(v).toUpperCase() : String(v)
+          })),
         setValues: values => {
           values.forEach((rowVals, offset) => {
             const idx = startRow - 1 + offset
@@ -35,9 +60,23 @@ function loadApp({ configRows = [], hasConfigSheet = true, fetchImpl } = {}) {
             })
           })
         },
+        clear: () => {
+          for (let offset = 0; offset < numRows; offset++) {
+            const idx = startRow - 1 + offset
+            if (!storedConfigRows[idx]) continue
+            for (let colOffset = 0; colOffset < numCols; colOffset++) {
+              storedConfigRows[idx][startCol - 1 + colOffset] = ''
+            }
+          }
+        },
+        clearDataValidations: () => {},
         setFontWeight: () => {},
         insertCheckboxes: () => { checkboxesInserted += numRows },
-        shiftRowGroupDepth: delta => { rowGroupDepthShifts += delta }
+        shiftRowGroupDepth: delta => {
+          if (delta > 0) {
+            rowGroups.push({ start: startRow, end: startRow + numRows - 1 })
+          }
+        }
       }),
       collapseAllRowGroups: () => { collapsedGroups += 1 }
     }
@@ -90,7 +129,7 @@ function loadApp({ configRows = [], hasConfigSheet = true, fetchImpl } = {}) {
     requests,
     createdSheets,
     storedConfigRows,
-    stats: () => ({ checkboxesInserted, rowGroupDepthShifts, collapsedGroups })
+    stats: () => ({ checkboxesInserted, rowGroups: rowGroups.map(g => ({ ...g })), collapsedGroups })
   }
 }
 
@@ -170,7 +209,7 @@ test('setupConfigSheet creates collapsed field checkboxes and preserves existing
   context.setupConfigSheet()
   const firstRun = stats()
   assert.equal(firstRun.checkboxesInserted, fieldCount)
-  assert.equal(firstRun.rowGroupDepthShifts, 1)
+  assert.deepEqual(firstRun.rowGroups, [{ start: 11, end: 10 + fieldCount }])
   assert.equal(firstRun.collapsedGroups, 1)
   assert.equal(storedConfigRows[0][1], 'https://okapi.example.org')
   assert.deepEqual(storedConfigRows.slice(3, 9), [
@@ -182,11 +221,58 @@ test('setupConfigSheet creates collapsed field checkboxes and preserves existing
     ['CQL query', '']
   ])
 
-  // Re-running should be idempotent and not duplicate rows or re-shift group depth.
+  // Re-running should be idempotent and keep one single collapsed group over all fields.
   const countAfterFirst = storedConfigRows.length
   context.setupConfigSheet()
   assert.equal(storedConfigRows.length, countAfterFirst)
-  assert.equal(stats().rowGroupDepthShifts, 1)
+  assert.deepEqual(stats().rowGroups, [{ start: 11, end: 10 + fieldCount }])
+})
+
+test('setupConfigSheet normalizes an existing sheet with filters below Return fields into one group', () => {
+  const { context, storedConfigRows, stats } = loadApp({
+    configRows: [
+      ['API URL', 'https://okapi.example.org', 'production'],
+      ['Tenant ID', 'member-a'],
+      ['Username', 'librarian'],
+      ['Max rows', 500],
+      ['CQL query', ''],
+      ['Return fields', 'Include'],
+      ['Item UUID', false],
+      ['Barcode', true],
+      ['Title', true],
+      ['Call number start', 'QA'],
+      ['Status filter', 'Available'],
+      ['Local note', 'keep me']
+    ],
+    configRowGroups: [{ start: 7, end: 9 }]
+  })
+
+  const fieldCount = vm.runInContext('FIELDS.length', context)
+  context.setupConfigSheet()
+
+  // All settings (including filters that had been appended below Return fields) belong at the top.
+  assert.deepEqual(storedConfigRows.slice(0, 9), [
+    ['API URL', 'https://okapi.example.org', 'production'],
+    ['Tenant ID', 'member-a', ''],
+    ['Username', 'librarian', ''],
+    ['Call number start', 'QA', ''],
+    ['Call number end', '', ''],
+    ['Status filter', 'Available', ''],
+    ['Note contains', '', ''],
+    ['Max rows', 500, ''],
+    ['CQL query', '', '']
+  ])
+  assert.deepEqual(storedConfigRows[9], ['Return fields', 'Include', ''])
+
+  // Existing checkbox overrides and newly added fields sit together in one single row group.
+  const fieldRows = storedConfigRows.slice(10, 10 + fieldCount)
+  assert.equal(fieldRows.find(r => r[0] === 'Item UUID')[1], false)
+  assert.equal(fieldRows.find(r => r[0] === 'Holdings action note')[1], false)
+  assert.equal(fieldRows.find(r => r[0] === 'OCN')[1], false)
+  assert.deepEqual(stats().rowGroups, [{ start: 11, end: 10 + fieldCount }])
+
+  // Unrecognized user rows are preserved below the fields group.
+  assert.deepEqual(storedConfigRows[10 + fieldCount], ['Local note', 'keep me', ''])
 })
 
 test('setupConfigSheet scaffolds properly cased labels without colliding with field names', () => {

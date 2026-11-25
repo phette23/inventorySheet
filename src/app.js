@@ -120,66 +120,94 @@ function showPasswordDialog() {
   )
 }
 
-// Create or update the "config" tab with core settings and a collapsed field checkbox group.
+// Remove all row groups across the given row span so grouping can be rebuilt cleanly.
+function clearRowGroups(sheet, rowCount) {
+  if (typeof sheet.getRowGroupDepth !== 'function' || typeof sheet.getRowGroup !== 'function') return
+  for (let row = 1; row <= rowCount; row++) {
+    let depth = sheet.getRowGroupDepth(row)
+    while (depth > 0) {
+      sheet.getRowGroup(row, depth).remove()
+      depth = sheet.getRowGroupDepth(row)
+    }
+  }
+}
+
+// Create or normalize the "config" tab: settings on top, then one collapsed Return fields group.
 function setupConfigSheet() {
   const spreadsheet = SpreadsheetApp.getActiveSpreadsheet()
   let sheet = spreadsheet.getSheetByName('config')
   if (!sheet) sheet = spreadsheet.insertSheet('config')
 
-  const existingKeys = new Map()
+  const settingKeys = new Set(Object.values(CONFIG_SETTINGS).map(s => s.label.toLocaleLowerCase()))
+  const fieldKeys = new Set(FIELDS.map(f => f.name.toLocaleLowerCase()))
+  const headerKey = FIELDS_SECTION_HEADER.toLocaleLowerCase()
+
+  const existingSettings = new Map()
+  const existingFields = new Map()
+  const extraRows = []
+
   const lastRow = sheet.getLastRow()
+  const lastCol = Math.max(typeof sheet.getLastColumn === 'function' ? sheet.getLastColumn() : 2, 2)
 
   if (lastRow > 0) {
-    sheet.getRange(1, 1, lastRow, 2).getDisplayValues().forEach((row, index) => {
-      const key = String(row[0]).trim().toLocaleLowerCase()
-      if (key && !existingKeys.has(key)) existingKeys.set(key, index + 1)
+    const range = sheet.getRange(1, 1, lastRow, lastCol)
+    const values = typeof range.getValues === 'function' ? range.getValues() : range.getDisplayValues()
+    values.forEach(row => {
+      const key = String(row[0] || '').trim().toLocaleLowerCase()
+      const tail = row.slice(2)
+      if (settingKeys.has(key)) {
+        if (!existingSettings.has(key)) {
+          existingSettings.set(key, { value: row[1] === undefined ? '' : row[1], tail })
+        }
+      } else if (fieldKeys.has(key)) {
+        if (!existingFields.has(key)) existingFields.set(key, { value: parseCheckbox(row[1]), tail })
+      } else if (key === headerKey) {
+        // Rebuilt directly below CONFIG_SETTINGS.
+      } else if (row.some(cell => String(cell === null || cell === undefined ? '' : cell).trim() !== '')) {
+        extraRows.push(row)
+      }
     })
+
+    clearRowGroups(sheet, lastRow)
+    if (typeof range.clear === 'function') range.clear()
+    if (typeof range.clearDataValidations === 'function') range.clearDataValidations()
   }
 
-  let nextRow = lastRow + 1
+  const padRow = (a, b, tail = []) => {
+    const row = [a === undefined ? '' : a, b === undefined ? '' : b, ...tail]
+    while (row.length < lastCol) row.push('')
+    return row
+  }
 
+  const rows = []
   Object.values(CONFIG_SETTINGS).forEach(({ label, defaultValue }) => {
-    const key = label.toLocaleLowerCase()
-    if (!existingKeys.has(key)) {
-      sheet.getRange(nextRow, 1, 1, 2).setValues([[label, defaultValue]])
-      existingKeys.set(key, nextRow)
-      nextRow += 1
-    }
+    const existing = existingSettings.get(label.toLocaleLowerCase())
+    rows.push(padRow(label, existing ? existing.value : defaultValue, existing ? existing.tail : []))
   })
 
-  const headerKey = FIELDS_SECTION_HEADER.toLocaleLowerCase()
-  if (!existingKeys.has(headerKey)) {
-    const headerRange = sheet.getRange(nextRow, 1, 1, 2)
-    headerRange.setValues([[FIELDS_SECTION_HEADER, 'Include']])
-    if (typeof headerRange.setFontWeight === 'function') headerRange.setFontWeight('bold')
-    existingKeys.set(headerKey, nextRow)
-    nextRow += 1
-  }
+  const headerRow = rows.length + 1
+  rows.push(padRow(FIELDS_SECTION_HEADER, 'Include'))
 
-  const addedFieldStart = nextRow
-
+  const fieldsStartRow = rows.length + 1
   FIELDS.forEach(field => {
-    const key = field.name.toLocaleLowerCase()
-    if (!existingKeys.has(key)) {
-      const rowRange = sheet.getRange(nextRow, 1, 1, 2)
-      rowRange.setValues([[field.name, field.enabled]])
-      const checkboxCell = sheet.getRange(nextRow, 2, 1, 1)
-      if (typeof checkboxCell.insertCheckboxes === 'function') checkboxCell.insertCheckboxes()
-      existingKeys.set(key, nextRow)
-      nextRow += 1
-    }
+    const existing = existingFields.get(field.name.toLocaleLowerCase())
+    const checked = existing && existing.value !== null ? existing.value : field.enabled
+    rows.push(padRow(field.name, checked, existing ? existing.tail : []))
   })
 
-  const addedFieldCount = nextRow - addedFieldStart
-  if (addedFieldCount > 0) {
-    const groupRange = sheet.getRange(addedFieldStart, 1, addedFieldCount, 1)
-    if (typeof groupRange.shiftRowGroupDepth === 'function') {
-      groupRange.shiftRowGroupDepth(1)
-    }
-    if (typeof sheet.collapseAllRowGroups === 'function') {
-      sheet.collapseAllRowGroups()
-    }
-  }
+  extraRows.forEach(row => rows.push(padRow(row[0], row[1], row.slice(2))))
+
+  sheet.getRange(1, 1, rows.length, lastCol).setValues(rows)
+
+  const headerRange = sheet.getRange(headerRow, 1, 1, 2)
+  if (typeof headerRange.setFontWeight === 'function') headerRange.setFontWeight('bold')
+
+  const checkboxRange = sheet.getRange(fieldsStartRow, 2, FIELDS.length, 1)
+  if (typeof checkboxRange.insertCheckboxes === 'function') checkboxRange.insertCheckboxes()
+
+  const groupRange = sheet.getRange(fieldsStartRow, 1, FIELDS.length, 1)
+  if (typeof groupRange.shiftRowGroupDepth === 'function') groupRange.shiftRowGroupDepth(1)
+  if (typeof sheet.collapseAllRowGroups === 'function') sheet.collapseAllRowGroups()
 
   return spreadsheet.setActiveSheet(sheet)
 }
